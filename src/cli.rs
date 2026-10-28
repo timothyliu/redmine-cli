@@ -107,6 +107,9 @@ pub struct PageArgs {
 pub enum IssueCommand {
     /// List issues
     List(IssueListArgs),
+    /// Search issues for text (full-text search when the server has /search.json,
+    /// otherwise subject and description only)
+    Search(IssueSearchArgs),
     /// Show one issue
     View(IssueViewArgs),
     /// Create an issue
@@ -115,6 +118,23 @@ pub enum IssueCommand {
     Update(IssueUpdateArgs),
     /// Add a comment (journal note) to an issue
     Comment(IssueCommentArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct IssueSearchArgs {
+    /// Text to search for
+    pub text: String,
+    /// Project id or identifier
+    #[arg(long, short)]
+    pub project: Option<String>,
+    /// Only open issues
+    #[arg(long)]
+    pub open: bool,
+    /// Match issue subjects only
+    #[arg(long)]
+    pub titles_only: bool,
+    #[command(flatten)]
+    pub page: PageArgs,
 }
 
 #[derive(Args, Debug)]
@@ -143,8 +163,9 @@ pub struct IssueListArgs {
     /// Sort order, e.g. "updated_on:desc" or "priority:desc,id"
     #[arg(long)]
     pub sort: Option<String>,
-    /// Raw filter passed to /issues.json (repeatable), e.g. cf_3=foo or "updated_on=>=2024-01-01"
-    #[arg(long = "filter", short = 'f', value_name = "KEY=VALUE")]
+    /// Extra filter "FIELD OP [VALUE[|VALUE]]" (repeatable), e.g. "updated_on >= 2026-01-01",
+    /// "cf_3 = foo", "subject ~ vpn", "due_date !*"
+    #[arg(long = "filter", short = 'f', value_name = "FIELD OP VALUE")]
     pub filters: Vec<String>,
     #[command(flatten)]
     pub page: PageArgs,

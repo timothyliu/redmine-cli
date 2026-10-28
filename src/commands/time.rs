@@ -2,7 +2,7 @@ use reqwest::Method;
 use serde_json::{Map, json};
 
 use super::lookup::{self, Kind};
-use super::{id_value, unwrap_key};
+use super::{Filters, id_value, unwrap_key, user_value};
 use crate::cli::{TimeCommand, TimeListArgs, TimeLogArgs};
 use crate::client::Client;
 use crate::context::Context;
@@ -28,21 +28,23 @@ pub fn run(ctx: &Context, cmd: TimeCommand) -> Result<()> {
 }
 
 fn list(ctx: &Context, client: &Client, args: TimeListArgs) -> Result<()> {
-    let mut q: Vec<(String, String)> = Vec::new();
+    let mut filters = Filters::default();
+    if let Some(u) = &args.user {
+        filters.set("user_id", "=", vec![user_value(u)?]);
+    }
+    match (args.from, args.to) {
+        (Some(from), Some(to)) => filters.set("spent_on", "><", vec![from, to]),
+        (Some(from), None) => filters.set("spent_on", ">=", vec![from]),
+        (None, Some(to)) => filters.set("spent_on", "<=", vec![to]),
+        (None, None) => {}
+    }
+    // project_id and issue_id scope the request rather than filter it.
+    let mut q = filters.into_query();
     if let Some(p) = args.project {
         q.push(("project_id".into(), p));
     }
     if let Some(i) = args.issue {
         q.push(("issue_id".into(), i.to_string()));
-    }
-    if let Some(u) = args.user {
-        q.push(("user_id".into(), u));
-    }
-    if let Some(d) = args.from {
-        q.push(("from".into(), d));
-    }
-    if let Some(d) = args.to {
-        q.push(("to".into(), d));
     }
     let value = client.list("/time_entries.json", "time_entries", q, &args.page)?;
     ctx.out.list(value, "time_entries", LIST_COLUMNS)

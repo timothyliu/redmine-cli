@@ -1,18 +1,19 @@
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use reqwest::Method;
 use serde_json::{Map, Value, json};
 
 use super::lookup::{self, Kind};
-use super::{id_value, parse_kv, read_text, unwrap_key};
+use super::{Filters, id_value, parse_kv, project_segment, read_text, unwrap_key, user_value};
 use crate::cli::{
-    IssueCommand, IssueCommentArgs, IssueCreateArgs, IssueFields, IssueListArgs, IssueUpdateArgs,
-    IssueViewArgs,
+    IssueCommand, IssueCommentArgs, IssueCreateArgs, IssueFields, IssueListArgs, IssueSearchArgs,
+    IssueUpdateArgs, IssueViewArgs, PageArgs,
 };
 use crate::client::Client;
 use crate::context::Context;
 use crate::error::{AppError, Result};
-use crate::output::{Column, cell, get_path, pretty};
+use crate::output::{Column, Format, cell, get_path, pretty};
 
 const LIST_COLUMNS: &[Column] = &[
     ("ID", "id"),
@@ -23,10 +24,13 @@ const LIST_COLUMNS: &[Column] = &[
     ("SUBJECT", "subject"),
 ];
 
+const SEARCH_COLUMNS: &[Column] = &[("ID", "id"), ("DATE", "datetime"), ("TITLE", "title")];
+
 pub fn run(ctx: &Context, cmd: IssueCommand) -> Result<()> {
     let (base, client) = ctx.client()?;
     match cmd {
         IssueCommand::List(args) => list(ctx, &client, args),
+        IssueCommand::Search(args) => search(ctx, &client, &base, args),
         IssueCommand::View(args) => view(ctx, &client, &base, args),
         IssueCommand::Create(args) => create(ctx, &client, &base, args),
         IssueCommand::Update(args) => update(ctx, &client, &base, args),
@@ -34,43 +38,182 @@ pub fn run(ctx: &Context, cmd: IssueCommand) -> Result<()> {
     }
 }
 
+/// Full-text search via /search.json (Redmine 3.3+; also covers comments unless
+/// --titles-only). It answers 404 on older servers (and for an unknown project), so
+/// fall back to "contains" filters on subject and description, shaped like search
+/// results.
+fn search(ctx: &Context, client: &Client, base: &str, args: IssueSearchArgs) -> Result<()> {
+    let project = args.project.as_deref().map(project_segment).transpose()?;
+    let path = match project {
+        Some(p) => format!("/projects/{p}/search.json"),
+        None => "/search.json".to_string(),
+    };
+    // Redmine 3.3.0-3.4.9 and 4.0.0-4.0.2 jump to the issue for a bare number ("123",
+    // "#123") instead of searching; a quoted phrase searches the same token everywhere.
+    let digits = args.text.trim().trim_start_matches('#');
+    let text = if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        format!("\"{}\"", args.text.trim())
+    } else {
+        args.text.clone()
+    };
+    let mut q = vec![
+        ("q".to_string(), text),
+        ("issues".to_string(), "1".to_string()),
+    ];
+    if args.open {
+        q.push(("open_issues".into(), "1".into()));
+    }
+    if args.titles_only {
+        q.push(("titles_only".into(), "1".into()));
+    }
+    let fulltext = match client.list(&path, "results", q, &args.page) {
+        Ok(v) => Some(v),
+        Err(AppError::Api { status: 404, .. }) => None,
+        Err(e) => return Err(e),
+    };
+    let value = match fulltext {
+        Some(mut v) => {
+            v["search"] = json!("fulltext");
+            v
+        }
+        None => {
+            let v = search_by_filters(client, base, project, &args)?;
+            if ctx.out.format == Format::Text {
+                eprintln!("note: searched subject and description only, not comments");
+            }
+            v
+        }
+    };
+    ctx.out.list(value, "results", SEARCH_COLUMNS)
+}
+
+fn search_by_filters(
+    client: &Client,
+    base: &str,
+    project: Option<&str>,
+    args: &IssueSearchArgs,
+) -> Result<Value> {
+    let fields: &[&str] = if args.titles_only {
+        &["subject"]
+    } else {
+        &["subject", "description"]
+    };
+    let every = PageArgs {
+        limit: 100,
+        offset: 0,
+        all: true,
+    };
+    // Filters are ANDed, so each field is a separate query; merge by id.
+    let mut found: BTreeMap<u64, Value> = BTreeMap::new();
+    let mut truncated = false;
+    for field in fields {
+        let mut filters = Filters::default();
+        filters.set("status_id", if args.open { "o" } else { "*" }, Vec::new());
+        filters.set(field, "~", vec![args.text.clone()]);
+        let mut q = filters.into_query();
+        if let Some(p) = project {
+            q.push(("project_id".into(), p.to_string()));
+        }
+        let page = client.list("/issues.json", "issues", q, &every)?;
+        truncated |= page.get("truncated") == Some(&json!(true));
+        for issue in page["issues"].as_array().into_iter().flatten() {
+            if let Some(id) = issue["id"].as_u64() {
+                found
+                    .entry(id)
+                    .or_insert_with(|| search_result(base, issue));
+            }
+        }
+    }
+
+    let total = found.len();
+    let take = if args.page.all {
+        usize::MAX
+    } else {
+        args.page.limit.min(100) as usize
+    };
+    let results: Vec<Value> = found
+        .into_values()
+        .rev()
+        .skip(args.page.offset as usize)
+        .take(take)
+        .collect();
+    let limit = if args.page.all { results.len() } else { take };
+    let mut value = json!({
+        "results": results,
+        "total_count": total,
+        "offset": args.page.offset,
+        "limit": limit,
+        "search": "subject_description",
+    });
+    if truncated {
+        value["truncated"] = json!(true);
+    }
+    Ok(value)
+}
+
+/// Shapes an issue like a /search.json result.
+fn search_result(base: &str, issue: &Value) -> Value {
+    let g = |path: &str| cell(get_path(issue, path));
+    json!({
+        "id": issue["id"],
+        "title": format!("{} #{} ({}): {}", g("tracker.name"), g("id"), g("status.name"), g("subject")),
+        "type": "issue",
+        "url": format!("{base}/issues/{}", g("id")),
+        "description": issue["description"],
+        "datetime": issue["created_on"],
+    })
+}
+
 fn list(ctx: &Context, client: &Client, args: IssueListArgs) -> Result<()> {
-    let mut q: Vec<(String, String)> = Vec::new();
-    if let Some(p) = args.project {
-        q.push(("project_id".into(), p));
+    // Redmine applies a saved query's own filters and ignores any others.
+    let filtered = args.status.is_some()
+        || args.assignee.is_some()
+        || args.author.is_some()
+        || args.tracker.is_some()
+        || args.priority.is_some()
+        || !args.filters.is_empty();
+    if args.query.is_some() && filtered {
+        return Err(AppError::Usage(
+            "--query applies the saved query's filters; Redmine ignores other filters with it"
+                .into(),
+        ));
     }
-    // A saved query carries its own status filter; only default to "open" without one.
-    match (&args.status, args.query) {
-        (Some(s), _) => q.push(("status_id".into(), lookup::status_filter(client, s)?)),
-        (None, None) => q.push(("status_id".into(), "open".into())),
-        (None, Some(_)) => {}
+
+    let mut filters = Filters::default();
+    if let Some(s) = &args.status {
+        let (op, values) = lookup::status_filter(client, s)?;
+        filters.set("status_id", op, values);
     }
-    if let Some(a) = args.assignee {
-        q.push(("assigned_to_id".into(), a));
+    if let Some(a) = &args.assignee {
+        filters.set("assigned_to_id", "=", vec![user_value(a)?]);
     }
-    if let Some(a) = args.author {
-        q.push(("author_id".into(), a));
+    if let Some(a) = &args.author {
+        filters.set("author_id", "=", vec![user_value(a)?]);
     }
     if let Some(t) = &args.tracker {
-        q.push((
-            "tracker_id".into(),
-            lookup::resolve(client, Kind::Tracker, t)?,
-        ));
+        let id = lookup::resolve(client, Kind::Tracker, t)?;
+        filters.set("tracker_id", "=", vec![id]);
     }
     if let Some(p) = &args.priority {
-        q.push((
-            "priority_id".into(),
-            lookup::resolve(client, Kind::Priority, p)?,
-        ));
+        let id = lookup::resolve(client, Kind::Priority, p)?;
+        filters.set("priority_id", "=", vec![id]);
+    }
+    for f in &args.filters {
+        filters.set_expression(f)?;
+    }
+    if args.query.is_none() && !filters.has("status_id") {
+        filters.set("status_id", "o", Vec::new());
+    }
+
+    let mut q = filters.into_query();
+    if let Some(p) = args.project {
+        q.push(("project_id".into(), p));
     }
     if let Some(id) = args.query {
         q.push(("query_id".into(), id.to_string()));
     }
     if let Some(s) = args.sort {
         q.push(("sort".into(), s));
-    }
-    for f in &args.filters {
-        q.push(parse_kv(f)?);
     }
     let value = client.list("/issues.json", "issues", q, &args.page)?;
     ctx.out.list(value, "issues", LIST_COLUMNS)

@@ -68,13 +68,13 @@ pub fn resolve(client: &Client, kind: Kind, value: &str) -> Result<String> {
     )))
 }
 
-/// Status filter for issue lists: open | closed | all | * | name | id.
-pub fn status_filter(client: &Client, value: &str) -> Result<String> {
+/// Status filter for issue lists (operator, values): open | closed | all | * | name | id.
+pub fn status_filter(client: &Client, value: &str) -> Result<(&'static str, Vec<String>)> {
     match value.trim().to_lowercase().as_str() {
-        "open" => Ok("open".into()),
-        "closed" => Ok("closed".into()),
-        "all" | "*" => Ok("*".into()),
-        _ => resolve(client, Kind::Status, value),
+        "open" => Ok(("o", Vec::new())),
+        "closed" => Ok(("c", Vec::new())),
+        "all" | "*" => Ok(("*", Vec::new())),
+        _ => Ok(("=", vec![resolve(client, Kind::Status, value)?])),
     }
 }
 
