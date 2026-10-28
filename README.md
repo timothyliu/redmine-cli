@@ -44,6 +44,17 @@ redmine --profile work auth login --url https://redmine.work.example
 redmine --profile work issue list -a me
 ```
 
+#### Keychain prompts after every install
+
+macOS asks again whether `redmine` may read its keychain item after every `cargo install`. A cargo build is only ad-hoc signed, so its code identity is a hash that changes with each build, and an earlier "Always Allow" no longer applies. To stop this, sign each build with the same self-signed identity:
+
+```sh
+cargo install --git https://github.com/timothyliu/redmine-cli
+./scripts/sign-macos.sh           # from a clone; signs ~/.cargo/bin/redmine (or the path given)
+```
+
+The first run creates a code-signing identity named `redmine-cli-codesign` in your login keychain. It is a self-signed certificate that never leaves the machine, created with the system `/usr/bin/openssl`. The script then signs the binary with the identifier `redmine-cli`, and each later run only re-signs. The keychain checks a signed binary by its identifier and certificate rather than its hash, so after one "Always Allow", builds signed this way should not trigger the prompt again. Remove the identity in Keychain Access if you no longer want it.
+
 On Linux and Windows the same commands use the native store: the kernel keyutils keyring (which does not survive a reboot) and the Credential Manager. Environment variables are the more reliable option on those platforms.
 
 ### Environment variables
