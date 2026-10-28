@@ -44,16 +44,7 @@ redmine --profile work auth login --url https://redmine.work.example
 redmine --profile work issue list -a me
 ```
 
-#### 每次安裝後都跳出鑰匙圈授權
-
-每次 `cargo install` 之後，macOS 都會再問一次是否允許 `redmine` 讀取鑰匙圈項目。cargo 編出來的執行檔只有臨時簽章（ad-hoc），程式身分是一個每次編譯都會變的雜湊值，所以之前按的「永遠允許」就不再適用。解決方法是每次都用同一個自簽身分簽名：
-
-```sh
-cargo install --git https://github.com/timothyliu/redmine-cli
-./scripts/sign-macos.sh           # 在 clone 下來的 repo 裡執行；簽 ~/.cargo/bin/redmine（或指定的路徑）
-```
-
-第一次執行時，腳本會用系統的 `/usr/bin/openssl`，在登入鑰匙圈建立一個名為 `redmine-cli-codesign` 的程式碼簽署身分。這是自簽憑證，不會離開這台電腦。接著用識別碼 `redmine-cli` 簽名，之後再執行就只會重新簽名。鑰匙圈辨識簽過名的執行檔時，看的是識別碼和憑證，不是雜湊值，所以按過一次「永遠允許」之後，用這種方式簽過的版本應該就不會再跳出授權。不再需要時，可以在「鑰匙圈存取」中刪除這個身分。
+每次 `cargo install` 之後，macOS 會再問一次是否允許 `redmine` 讀取鑰匙圈項目。cargo 編出來的執行檔沒有 Apple 開發者 Team ID，鑰匙圈是用執行檔的雜湊值辨識它，而雜湊值每次編譯都會變。每次安裝後按一次「永遠允許」即可，或改用下方的環境變數。
 
 在 Linux 與 Windows 上，同樣的指令會使用系統原生的儲存機制：Linux 用 kernel keyutils（重開機後會消失），Windows 用認證管理員。這兩個平台建議改用環境變數，較為可靠。
 
