@@ -71,8 +71,11 @@ fn login(ctx: &Context, args: LoginArgs) -> Result<()> {
     });
     if std::env::var(ENV_API_KEY).is_ok_and(|v| !v.trim().is_empty()) {
         result["note"] = json!(format!(
-            "{ENV_API_KEY} is set and takes precedence over the keychain"
+            "{ENV_API_KEY} is set: commands use it (with {ENV_URL}) instead of the keychain"
         ));
+    }
+    if let Some(w) = credentials::cleartext_warning(&url) {
+        result["warning"] = json!(w);
     }
     ctx.out.object(result, |r| {
         let who = cell(get_path(r, "user.login"));
@@ -88,6 +91,9 @@ fn login(ctx: &Context, args: LoginArgs) -> Result<()> {
         );
         if let Some(note) = r.get("note") {
             s.push_str(&format!("\nnote: {}", cell(Some(note))));
+        }
+        if let Some(w) = r.get("warning") {
+            s.push_str(&format!("\nwarning: {}", cell(Some(w))));
         }
         s
     })
@@ -125,15 +131,22 @@ fn status(ctx: &Context) -> Result<()> {
     };
     result["user"] = current_user(&Client::new(&creds.url, key, false)?)?;
     result["authenticated"] = json!(true);
+    if let Some(w) = credentials::cleartext_warning(&creds.url) {
+        result["warning"] = json!(w);
+    }
     ctx.out.object(result, |r| {
-        format!(
+        let mut s = format!(
             "Logged in to {} as {}\n  url from:     {}\n  api key from: {}\n  profile:      {}",
             cell(r.get("url")),
             cell(get_path(r, "user.login")),
             source_label(creds.url_source),
             key_source.map_or("none", source_label),
             ctx.profile
-        )
+        );
+        if let Some(w) = r.get("warning") {
+            s.push_str(&format!("\nwarning: {}", cell(Some(w))));
+        }
+        s
     })
 }
 

@@ -73,29 +73,9 @@ pub(crate) fn id_value(s: String) -> Value {
         .unwrap_or(Value::String(s))
 }
 
-/// Removes every `api_key` field so keys never end up in agent transcripts or logs.
-pub(crate) fn redact(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            map.remove("api_key");
-            map.values_mut().for_each(redact);
-        }
-        Value::Array(items) => items.iter_mut().for_each(redact),
-        _ => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn redact_removes_nested_api_keys() {
-        let mut v = json!({"user": {"id": 1, "api_key": "secret", "x": [{"api_key": "s2"}]}});
-        redact(&mut v);
-        assert_eq!(v, json!({"user": {"id": 1, "x": [{}]}}));
-    }
 
     #[test]
     fn parse_kv_splits_on_first_equals() {

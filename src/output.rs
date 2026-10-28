@@ -66,7 +66,7 @@ impl Output {
                 .map(|(h, p)| (h.to_string(), p.to_string()))
                 .collect(),
         };
-        write_stdout(&table(items, &cols))?;
+        write_stdout(&strip_controls(&table(items, &cols)))?;
         if let Some(total) = value.get("total_count").and_then(Value::as_u64)
             && total > items.len() as u64
         {
@@ -88,9 +88,9 @@ impl Output {
                     .iter()
                     .map(|p| format!("{p}: {}", cell(get_path(&value, p))))
                     .collect();
-                write_stdout(&lines.join("\n"))
+                write_stdout(&strip_controls(&lines.join("\n")))
             }
-            (None, Format::Text) => write_stdout(render(&value).trim_end()),
+            (None, Format::Text) => write_stdout(&strip_controls(render(&value).trim_end())),
         }
     }
 
@@ -101,19 +101,48 @@ impl Output {
             serde_json::to_string(value)
         }
         .expect("serializing a Value cannot fail");
-        write_stdout(&s)
+        write_stdout(&escape_controls(&s))
     }
 
     pub fn error(&self, err: &AppError) {
         match self.format {
-            Format::Json => eprintln!("{}", err.to_json()),
-            Format::Text => eprintln!("error: {err}"),
+            Format::Json => eprintln!("{}", escape_controls(&err.to_json().to_string())),
+            Format::Text => eprintln!("error: {}", strip_controls(&err.to_string())),
         }
     }
 }
 
 pub fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).expect("serializing a Value cannot fail")
+}
+
+/// Characters a terminal may interpret: C0/C1 controls (ESC, CSI, OSC, BEL, CR...)
+/// and bidi overrides. Server content (issue text, error messages) can contain them.
+fn is_unsafe_char(c: char) -> bool {
+    (c.is_control() && c != '\n' && c != '\t')
+        || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Text output: drop unsafe characters.
+fn strip_controls(s: &str) -> String {
+    s.chars().filter(|&c| !is_unsafe_char(c)).collect()
+}
+
+/// JSON output: serde escapes C0 but emits C1, DEL and bidi characters raw.
+/// They can only occur inside string literals, so `\uXXXX` keeps the JSON valid.
+fn escape_controls(s: &str) -> String {
+    if !s.chars().any(is_unsafe_char) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if is_unsafe_char(c) {
+            out.push_str(&format!("\\u{:04x}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn write_stdout(s: &str) -> Result<()> {
@@ -250,6 +279,19 @@ mod tests {
         assert_eq!(cell(Some(&json!({"id": 3, "name": "Bug"}))), "Bug");
         assert_eq!(cell(Some(&json!("a\nb"))), "a b");
         assert_eq!(cell(None), "");
+    }
+
+    #[test]
+    fn escape_controls_keeps_json_valid() {
+        let v = json!({"s": "a\u{9b}b\u{202e}c\u{7f}", "n": "x\ny"});
+        let out = escape_controls(&serde_json::to_string_pretty(&v).unwrap());
+        assert!(!out.chars().any(is_unsafe_char));
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), v);
+    }
+
+    #[test]
+    fn strip_controls_keeps_newlines_and_tabs() {
+        assert_eq!(strip_controls("a\x1b[2Kb\r\n\tc\u{7}"), "a[2Kb\n\tc");
     }
 
     #[test]

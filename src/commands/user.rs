@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 
 use serde_json::Value;
 
-use super::{redact, unwrap_key};
+use super::unwrap_key;
 use crate::cli::UserCommand;
 use crate::context::Context;
 use crate::error::Result;
@@ -14,8 +14,7 @@ pub fn run(ctx: &Context, cmd: UserCommand) -> Result<()> {
         UserCommand::Me => "/users/current.json".to_string(),
         UserCommand::View { id } => format!("/users/{id}.json"),
     };
-    let mut user = unwrap_key(client.get(&path, &[])?, "user")?;
-    redact(&mut user);
+    let user = unwrap_key(client.get(&path, &[])?, "user")?;
     ctx.out.object(user, render_user)
 }
 

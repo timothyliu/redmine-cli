@@ -335,3 +335,189 @@ fn text_format_renders_table() {
         .success()
         .stdout("ID  NAME    DEFAULT\n2   Normal  true\n");
 }
+
+// ---- security regressions -------------------------------------------------
+
+#[test]
+fn cross_origin_redirect_is_not_followed() {
+    let mut server = Server::new();
+    let mut other = Server::new();
+    let stolen = other.mock("GET", "/stolen").expect(0).create();
+    server
+        .mock("GET", "/issues/1.json")
+        .with_status(302)
+        .with_header("location", &format!("{}/stolen", other.url()))
+        .create();
+
+    let out = redmine(&server)
+        .args(["issue", "view", "1"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(stderr_json(&out)["error"]["code"], "redirect");
+    stolen.assert();
+}
+
+#[test]
+fn same_origin_redirect_is_followed() {
+    let mut server = Server::new();
+    server
+        .mock("GET", "/old.json")
+        .with_status(301)
+        .with_header("location", "/new.json")
+        .create();
+    let new = server
+        .mock("GET", "/new.json")
+        .match_header("x-redmine-api-key", KEY)
+        .with_body(r#"{"ok":1}"#)
+        .create();
+
+    let out = redmine(&server)
+        .args(["api", "/old.json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout_json(&out)["ok"], 1);
+    new.assert();
+}
+
+#[test]
+fn api_key_value_is_scrubbed_from_any_response() {
+    let mut server = Server::new();
+    server
+        .mock("GET", "/users/current.xml")
+        .with_header("content-type", "application/xml")
+        .with_body(format!(
+            "<user><login>tim</login><api_key>{KEY}</api_key></user>"
+        ))
+        .create();
+    server
+        .mock("POST", "/issues.json")
+        .with_status(422)
+        .with_body(format!(r#"{{"errors":["bad key {KEY}"]}}"#))
+        .create();
+
+    redmine(&server)
+        .args(["api", "/users/current.xml"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(KEY).not())
+        .stdout(predicate::str::contains("<login>tim</login>"));
+    redmine(&server)
+        .args(["issue", "create", "-p", "x", "--subject", "s"])
+        .assert()
+        .code(6)
+        .stderr(predicate::str::contains(KEY).not());
+}
+
+#[test]
+fn text_mode_strips_terminal_escapes() {
+    let mut server = Server::new();
+    let issue = json!({"issue": {
+        "id": 1,
+        "subject": "a\u{1b}]0;PWNED\u{7}b\u{9b}31m",
+        "description": "line1\r\nline2\u{1b}[2K\u{202e}x",
+    }});
+    server
+        .mock("GET", "/issues/1.json")
+        .with_body(issue.to_string())
+        .create();
+    server
+        .mock("GET", "/issues.json")
+        .match_query(Matcher::Any)
+        .with_body(json!({"issues": [issue["issue"]], "total_count": 1}).to_string())
+        .create();
+
+    for args in [
+        vec!["-o", "text", "issue", "view", "1"],
+        vec!["-o", "text", "issue", "list"],
+    ] {
+        let out = redmine(&server).args(&args).output().unwrap();
+        assert!(out.status.success());
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            !stdout
+                .chars()
+                .any(|c| (c.is_control() && c != '\n') || ('\u{202a}'..='\u{202e}').contains(&c)),
+            "control characters leaked: {stdout:?}"
+        );
+        assert!(stdout.contains("a]0;PWNEDb"), "{stdout:?}");
+    }
+}
+
+#[test]
+fn json_mode_escapes_c1_and_bidi_controls() {
+    let mut server = Server::new();
+    server
+        .mock("GET", "/issues/1.json")
+        .with_body(json!({"issue": {"id": 1, "subject": "x\u{9b}31m\u{202e}y"}}).to_string())
+        .create();
+
+    let out = redmine(&server)
+        .args(["issue", "view", "1"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout.clone()).unwrap();
+    assert!(
+        !stdout.contains('\u{9b}') && !stdout.contains('\u{202e}'),
+        "{stdout:?}"
+    );
+    assert_eq!(stdout_json(&out)["subject"], "x\u{9b}31m\u{202e}y");
+}
+
+#[test]
+fn all_stops_at_item_cap_against_lying_server() {
+    let mut server = Server::new();
+    let items: Vec<Value> = (0..100).map(|i| json!({"id": i})).collect();
+    let pages = server
+        .mock("GET", "/issues.json")
+        .match_query(Matcher::Any)
+        .with_body(json!({"issues": items, "total_count": 1_000_000_000_000u64}).to_string())
+        .expect(3)
+        .create();
+
+    let out = redmine(&server)
+        .env("REDMINE_MAX_ITEMS", "300")
+        .args(["issue", "list", "--all"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["issues"].as_array().unwrap().len(), 300);
+    assert_eq!(v["truncated"], true);
+    pages.assert();
+}
+
+#[test]
+fn project_view_rejects_path_characters() {
+    let mut server = Server::new();
+    let pivot = server.mock("GET", Matcher::Any).expect(0).create();
+
+    let out = redmine(&server)
+        .args(["project", "view", "../../users/1.json?x=1#"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    pivot.assert();
+}
+
+#[test]
+fn http_url_warns_in_auth_status() {
+    let mut server = Server::new();
+    server
+        .mock("GET", "/users/current.json")
+        .with_body(r#"{"user":{"id":1,"login":"tim"}}"#)
+        .create();
+    // mockito listens on 127.0.0.1: loopback http must not warn.
+    let out = redmine(&server).args(["auth", "status"]).output().unwrap();
+    assert!(out.status.success());
+    assert!(stdout_json(&out).get("warning").is_none());
+}

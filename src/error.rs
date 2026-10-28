@@ -33,7 +33,7 @@ pub const EXIT_CODES: &[(i32, &str)] = &[
     (0, "success"),
     (
         1,
-        "unexpected error (I/O, unexpected HTTP status or response)",
+        "unexpected error (I/O, unexpected HTTP status or response, refused redirect)",
     ),
     (2, "usage error (bad flags or arguments)"),
     (3, "missing configuration or credentials"),
@@ -60,6 +60,7 @@ impl AppError {
                 403 => "forbidden",
                 404 => "not_found",
                 422 => "validation",
+                300..=399 => "redirect",
                 500..=599 => "server",
                 _ => "http",
             },

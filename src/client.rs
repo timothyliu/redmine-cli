@@ -1,8 +1,10 @@
+use std::io::Read;
 use std::time::Duration;
 
-use reqwest::Method;
 use reqwest::blocking::Client as Http;
-use reqwest::header::ACCEPT;
+use reqwest::header::{ACCEPT, LOCATION};
+use reqwest::redirect::Policy;
+use reqwest::{Method, Url};
 use serde_json::{Map, Value, json};
 
 use crate::cli::PageArgs;
@@ -10,6 +12,10 @@ use crate::error::{AppError, Result};
 
 /// Redmine refuses page sizes above 100.
 const MAX_PAGE: u32 = 100;
+/// Upper bound on one response body; a hostile server must not exhaust memory.
+const MAX_BODY_BYTES: u64 = 64 * 1024 * 1024;
+/// Default upper bound on items collected by `--all` (override: REDMINE_MAX_ITEMS).
+const DEFAULT_MAX_ITEMS: usize = 10_000;
 
 pub struct Client {
     http: Http,
@@ -27,6 +33,7 @@ impl Client {
         let http = Http::builder()
             .user_agent(concat!("redmine-cli/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(timeout))
+            .redirect(redirect_policy())
             .build()?;
         Ok(Self {
             http,
@@ -80,19 +87,46 @@ impl Client {
         }
         let resp = req.send()?;
         let status = resp.status().as_u16();
-        let text = resp.text()?;
+        if (300..400).contains(&status) {
+            let location = self.scrub(
+                resp.headers()
+                    .get(LOCATION)
+                    .and_then(|l| l.to_str().ok())
+                    .unwrap_or("?")
+                    .to_string(),
+            );
+            return Err(AppError::Api {
+                status,
+                message: format!(
+                    "refused to follow redirect from {method} {path} to {location}: \
+                     the API key is only sent to {}",
+                    self.base
+                ),
+                details: Vec::new(),
+            });
+        }
+        let text = self.scrub(read_limited(resp, MAX_BODY_BYTES)?);
         if !(200..300).contains(&status) {
             return Err(api_error(status, &method, path, &text));
         }
         if text.trim().is_empty() {
             return Ok(None);
         }
-        Ok(Some(
-            serde_json::from_str(&text).unwrap_or(Value::String(text)),
-        ))
+        let mut value = serde_json::from_str(&text).unwrap_or(Value::String(text));
+        remove_api_key_fields(&mut value);
+        Ok(Some(value))
     }
 
-    /// GET a paginated collection. With `--all`, follows `total_count` until exhausted.
+    /// Masks the key wherever the server echoes it (JSON, XML, HTML, error bodies).
+    fn scrub(&self, text: String) -> String {
+        if self.key.is_empty() || !text.contains(&self.key) {
+            return text;
+        }
+        text.replace(&self.key, "[REDACTED]")
+    }
+
+    /// GET a paginated collection. With `--all`, follows `total_count` until exhausted,
+    /// stopping at REDMINE_MAX_ITEMS (then the result carries `"truncated": true`).
     pub fn list(
         &self,
         path: &str,
@@ -100,41 +134,111 @@ impl Client {
         query: Vec<(String, String)>,
         page: &PageArgs,
     ) -> Result<Value> {
-        let with_page = |limit: u32, offset: u32| {
+        let with_page = |limit: u32, offset: u64| {
             let mut q = query.clone();
             q.push(("limit".into(), limit.to_string()));
             q.push(("offset".into(), offset.to_string()));
             q
         };
         if !page.all {
-            return self.get(path, &with_page(page.limit.min(MAX_PAGE), page.offset));
+            return self.get(
+                path,
+                &with_page(page.limit.min(MAX_PAGE), page.offset.into()),
+            );
         }
 
+        let max_items = std::env::var("REDMINE_MAX_ITEMS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_MAX_ITEMS);
         let mut items = Vec::new();
-        let mut offset = page.offset;
+        let mut offset = u64::from(page.offset);
+        let mut truncated = false;
         let total = loop {
             let resp = self.get(path, &with_page(MAX_PAGE, offset))?;
-            let batch = resp
+            let mut batch = resp
                 .get(key)
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
             let total = resp.get("total_count").and_then(Value::as_u64);
-            let n = batch.len() as u32;
-            items.extend(batch);
+            let n = batch.len() as u64;
             offset += n;
-            match total {
-                Some(t) if n > 0 && u64::from(offset) < t => continue,
-                _ => break total,
+            let room = max_items - items.len();
+            if batch.len() > room {
+                batch.truncate(room);
+            }
+            items.extend(batch);
+            let more = total.is_some_and(|t| n > 0 && offset < t);
+            if more && items.len() >= max_items {
+                truncated = true;
+            }
+            if !more || truncated {
+                break total;
             }
         };
         let count = items.len();
-        Ok(json!({
+        let mut result = json!({
             key: items,
             "total_count": total.unwrap_or(count as u64),
             "offset": page.offset,
             "limit": count,
-        }))
+        });
+        if truncated {
+            result["truncated"] = json!(true);
+        }
+        Ok(result)
+    }
+}
+
+fn read_limited(body: impl Read, limit: u64) -> Result<String> {
+    let mut buf = Vec::new();
+    body.take(limit + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > limit {
+        return Err(AppError::Response(format!(
+            "response body exceeds {} bytes",
+            limit
+        )));
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Removes every `api_key` field (e.g. /users/current.json returns the caller's).
+fn remove_api_key_fields(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("api_key");
+            map.values_mut().for_each(remove_api_key_fields);
+        }
+        Value::Array(items) => items.iter_mut().for_each(remove_api_key_fields),
+        _ => {}
+    }
+}
+
+/// Follows redirects only within the original origin (or an http -> https upgrade
+/// on the same host). reqwest strips `Authorization` on cross-host redirects but
+/// not custom headers, so following one would hand X-Redmine-API-Key to that host.
+fn redirect_policy() -> Policy {
+    Policy::custom(|attempt| {
+        if attempt.previous().len() > 10 {
+            return attempt.error("too many redirects");
+        }
+        match attempt.previous().first() {
+            Some(first) if same_origin_or_upgrade(first, attempt.url()) => attempt.follow(),
+            _ => attempt.stop(),
+        }
+    })
+}
+
+fn same_origin_or_upgrade(from: &Url, to: &Url) -> bool {
+    if from.host_str() != to.host_str() {
+        return false;
+    }
+    match (from.scheme(), to.scheme()) {
+        (a, b) if a == b => from.port_or_known_default() == to.port_or_known_default(),
+        ("http", "https") => true,
+        _ => false,
     }
 }
 
@@ -164,5 +268,40 @@ fn api_error(status: u16, method: &Method, path: &str, body: &str) -> AppError {
         status,
         message,
         details,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ok(from: &str, to: &str) -> bool {
+        same_origin_or_upgrade(&Url::parse(from).unwrap(), &Url::parse(to).unwrap())
+    }
+
+    #[test]
+    fn read_limited_rejects_oversized_bodies() {
+        assert_eq!(read_limited(&b"12345"[..], 5).unwrap(), "12345");
+        assert!(read_limited(&b"123456"[..], 5).is_err());
+    }
+
+    #[test]
+    fn removes_nested_api_key_fields() {
+        let mut v = json!({"user": {"id": 1, "api_key": "secret", "x": [{"api_key": "s2"}]}});
+        remove_api_key_fields(&mut v);
+        assert_eq!(v, json!({"user": {"id": 1, "x": [{}]}}));
+    }
+
+    #[test]
+    fn redirects_stay_on_the_original_origin() {
+        assert!(ok("https://r.example/a", "https://r.example/b"));
+        assert!(ok("http://r.example/a", "https://r.example/a"));
+        assert!(!ok("https://r.example/a", "http://r.example/a"));
+        assert!(!ok("https://r.example/a", "https://evil.example/a"));
+        assert!(!ok(
+            "https://r.example/a",
+            "https://r.example.evil.example/a"
+        ));
+        assert!(!ok("https://r.example/a", "https://r.example:8443/a"));
     }
 }

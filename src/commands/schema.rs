@@ -25,10 +25,11 @@ pub fn run(ctx: &Context, args: SchemaArgs) -> Result<()> {
         value["exit_codes"] = exit_codes.into();
         value["environment"] = json!({
             ENV_URL: "Redmine base URL (overrides the keychain)",
-            ENV_API_KEY: "API key (overrides the keychain)",
+            ENV_API_KEY: "API key; requires REDMINE_URL (never paired with a keychain URL)",
             "REDMINE_PROFILE": "keychain profile name (default: \"default\")",
             "REDMINE_FORMAT": "json | text",
             "REDMINE_TIMEOUT": "HTTP timeout in seconds (default: 30)",
+            "REDMINE_MAX_ITEMS": "maximum items collected by --all (default: 10000)",
             ENV_NO_KEYCHAIN: "set to 1 to never read or write the keychain",
         });
         value["conventions"] = json!({
@@ -36,7 +37,8 @@ pub fn run(ctx: &Context, args: SchemaArgs) -> Result<()> {
             "stderr": "errors as {\"error\": {\"code\", \"message\", ...}} in JSON mode",
             "lists": "{\"<collection>\": [...], \"total_count\", \"offset\", \"limit\"}",
             "objects": "unwrapped (no {\"issue\": ...} envelope)",
-            "secrets": "api_key fields are always removed from output",
+            "secrets": "the API key string and api_key fields are masked in every response",
+            "truncation": "--all results carry \"truncated\": true when REDMINE_MAX_ITEMS was hit",
         });
     }
     ctx.out.object(value, pretty)

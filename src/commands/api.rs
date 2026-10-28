@@ -1,7 +1,7 @@
 use reqwest::Method;
 use serde_json::{Value, json};
 
-use super::{parse_kv, read_text, redact};
+use super::{parse_kv, read_text};
 use crate::cli::ApiArgs;
 use crate::context::Context;
 use crate::error::{AppError, Result};
@@ -23,9 +23,8 @@ pub fn run(ctx: &Context, args: ApiArgs) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
 
     let (_, client) = ctx.client()?;
-    let mut value = client
+    let value = client
         .send(method, &args.path, &query, body.as_ref())?
         .unwrap_or_else(|| json!({ "ok": true }));
-    redact(&mut value);
     ctx.out.object(value, pretty)
 }

@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use super::unwrap_key;
 use crate::cli::ProjectCommand;
 use crate::context::Context;
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::output::{Column, cell, get_path};
 
 const LIST_COLUMNS: &[Column] = &[
@@ -21,6 +21,16 @@ pub fn run(ctx: &Context, cmd: ProjectCommand) -> Result<()> {
             ctx.out.list(value, "projects", LIST_COLUMNS)
         }
         ProjectCommand::View { id, include } => {
+            // The id becomes a path segment; refuse anything that could reach another endpoint.
+            if id.is_empty()
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                return Err(AppError::Usage(format!(
+                    "project must be a numeric id or identifier ([A-Za-z0-9_-]), got {id:?}"
+                )));
+            }
             let mut q = Vec::new();
             if !include.is_empty() {
                 q.push(("include".to_string(), include.join(",")));
