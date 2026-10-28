@@ -521,3 +521,71 @@ fn http_url_warns_in_auth_status() {
     assert!(out.status.success());
     assert!(stdout_json(&out).get("warning").is_none());
 }
+
+#[test]
+fn json_escaped_key_is_scrubbed() {
+    let mut server = Server::new();
+    // The raw body never contains KEY; only the decoded JSON string does.
+    // Built without a literal backslash so no tooling can pre-decode the escapes.
+    let escaped: String = "123"
+        .chars()
+        .map(|c| format!("{}u{:04x}", char::from(92u8), c as u32))
+        .collect();
+    let body = format!(r#"{{"note":"test-key-{escaped}"}}"#);
+    assert!(!body.contains(KEY), "{body}");
+    server.mock("GET", "/echo.json").with_body(body).create();
+
+    let out = redmine(&server)
+        .args(["api", "/echo.json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(stdout_json(&out)["note"], "[REDACTED]");
+}
+
+#[test]
+fn redirect_outside_base_path_is_not_followed() {
+    let mut server = Server::new();
+    let other_app = server.mock("GET", "/other-app/collect").expect(0).create();
+    server
+        .mock("GET", "/redmine/issues/1.json")
+        .with_status(302)
+        .with_header("location", "/other-app/collect")
+        .create();
+
+    let out = redmine(&server)
+        .env("REDMINE_URL", format!("{}/redmine", server.url()))
+        .args(["issue", "view", "1"])
+        .output()
+        .unwrap();
+    assert_eq!(stderr_json(&out)["error"]["code"], "redirect");
+    other_app.assert();
+}
+
+#[test]
+fn all_stops_at_byte_cap() {
+    let mut server = Server::new();
+    let big = "x".repeat(1000);
+    let items: Vec<Value> = (0..100).map(|i| json!({"id": i, "s": big})).collect();
+    let pages = server
+        .mock("GET", "/issues.json")
+        .match_query(Matcher::Any)
+        .with_body(json!({"issues": items, "total_count": 1_000_000u64}).to_string())
+        .expect(2)
+        .create();
+
+    let out = redmine(&server)
+        .env("REDMINE_MAX_BYTES", "150000")
+        .args(["issue", "list", "--all"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["truncated"], true);
+    assert!(v["issues"].as_array().unwrap().len() < 200);
+    pages.assert();
+}

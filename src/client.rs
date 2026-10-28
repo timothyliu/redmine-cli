@@ -16,6 +16,8 @@ const MAX_PAGE: u32 = 100;
 const MAX_BODY_BYTES: u64 = 64 * 1024 * 1024;
 /// Default upper bound on items collected by `--all` (override: REDMINE_MAX_ITEMS).
 const DEFAULT_MAX_ITEMS: usize = 10_000;
+/// Default upper bound on JSON bytes collected by `--all` (override: REDMINE_MAX_BYTES).
+const DEFAULT_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 pub struct Client {
     http: Http,
@@ -33,7 +35,7 @@ impl Client {
         let http = Http::builder()
             .user_agent(concat!("redmine-cli/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(timeout))
-            .redirect(redirect_policy())
+            .redirect(redirect_policy(base))
             .build()?;
         Ok(Self {
             http,
@@ -105,19 +107,31 @@ impl Client {
                 details: Vec::new(),
             });
         }
-        let text = self.scrub(read_limited(resp, MAX_BODY_BYTES)?);
+        let text = read_limited(resp, MAX_BODY_BYTES)?;
+        // Parse first, then mask: this catches keys hidden behind JSON escapes
+        // and can never break the JSON structure.
+        let mut value = (!text.trim().is_empty())
+            .then(|| serde_json::from_str(&text).unwrap_or(Value::String(text)));
+        if let Some(v) = value.as_mut() {
+            self.scrub_value(v);
+            remove_api_key_fields(v);
+        }
         if !(200..300).contains(&status) {
-            return Err(api_error(status, &method, path, &text));
+            return Err(api_error(status, &method, path, value.as_ref()));
         }
-        if text.trim().is_empty() {
-            return Ok(None);
-        }
-        let mut value = serde_json::from_str(&text).unwrap_or(Value::String(text));
-        remove_api_key_fields(&mut value);
-        Ok(Some(value))
+        Ok(value)
     }
 
-    /// Masks the key wherever the server echoes it (JSON, XML, HTML, error bodies).
+    /// Masks the key in every string of a response (JSON values, or a raw XML/HTML body).
+    fn scrub_value(&self, value: &mut Value) {
+        match value {
+            Value::String(s) => *s = self.scrub(std::mem::take(s)),
+            Value::Array(items) => items.iter_mut().for_each(|v| self.scrub_value(v)),
+            Value::Object(map) => map.values_mut().for_each(|v| self.scrub_value(v)),
+            _ => {}
+        }
+    }
+
     fn scrub(&self, text: String) -> String {
         if self.key.is_empty() || !text.contains(&self.key) {
             return text;
@@ -147,17 +161,15 @@ impl Client {
             );
         }
 
-        let max_items = std::env::var("REDMINE_MAX_ITEMS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(DEFAULT_MAX_ITEMS);
+        let max_items = env_limit("REDMINE_MAX_ITEMS", DEFAULT_MAX_ITEMS);
+        let max_bytes = env_limit("REDMINE_MAX_BYTES", DEFAULT_MAX_BYTES);
         let mut items = Vec::new();
+        let mut bytes = 0usize;
         let mut offset = u64::from(page.offset);
         let mut truncated = false;
         let total = loop {
             let resp = self.get(path, &with_page(MAX_PAGE, offset))?;
-            let mut batch = resp
+            let batch = resp
                 .get(key)
                 .and_then(Value::as_array)
                 .cloned()
@@ -165,13 +177,16 @@ impl Client {
             let total = resp.get("total_count").and_then(Value::as_u64);
             let n = batch.len() as u64;
             offset += n;
-            let room = max_items - items.len();
-            if batch.len() > room {
-                batch.truncate(room);
+            for item in batch {
+                if items.len() >= max_items || bytes >= max_bytes {
+                    truncated = true;
+                    break;
+                }
+                bytes += item.to_string().len();
+                items.push(item);
             }
-            items.extend(batch);
             let more = total.is_some_and(|t| n > 0 && offset < t);
-            if more && items.len() >= max_items {
+            if more && (items.len() >= max_items || bytes >= max_bytes) {
                 truncated = true;
             }
             if !more || truncated {
@@ -190,6 +205,14 @@ impl Client {
         }
         Ok(result)
     }
+}
+
+fn env_limit(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
 }
 
 fn read_limited(body: impl Read, limit: u64) -> Result<String> {
@@ -216,17 +239,26 @@ fn remove_api_key_fields(value: &mut Value) {
     }
 }
 
-/// Follows redirects only within the original origin (or an http -> https upgrade
-/// on the same host). reqwest strips `Authorization` on cross-host redirects but
-/// not custom headers, so following one would hand X-Redmine-API-Key to that host.
-fn redirect_policy() -> Policy {
-    Policy::custom(|attempt| {
+/// Follows redirects only within the original origin (or an http -> https:443 upgrade
+/// on the same host) and under the base path. reqwest strips `Authorization` on
+/// cross-host redirects but not custom headers, so following one would hand
+/// X-Redmine-API-Key to that host.
+fn redirect_policy(base: &str) -> Policy {
+    let base_path = Url::parse(base)
+        .map(|u| u.path().trim_end_matches('/').to_string())
+        .unwrap_or_default();
+    Policy::custom(move |attempt| {
         if attempt.previous().len() > 10 {
             return attempt.error("too many redirects");
         }
-        match attempt.previous().first() {
-            Some(first) if same_origin_or_upgrade(first, attempt.url()) => attempt.follow(),
-            _ => attempt.stop(),
+        let allowed = attempt.previous().first().is_some_and(|first| {
+            same_origin_or_upgrade(first, attempt.url())
+                && within_base_path(&base_path, attempt.url().path())
+        });
+        if allowed {
+            attempt.follow()
+        } else {
+            attempt.stop()
         }
     })
 }
@@ -237,14 +269,22 @@ fn same_origin_or_upgrade(from: &Url, to: &Url) -> bool {
     }
     match (from.scheme(), to.scheme()) {
         (a, b) if a == b => from.port_or_known_default() == to.port_or_known_default(),
-        ("http", "https") => true,
+        ("http", "https") => to.port_or_known_default() == Some(443),
         _ => false,
     }
 }
 
-fn api_error(status: u16, method: &Method, path: &str, body: &str) -> AppError {
-    let details: Vec<String> = serde_json::from_str::<Value>(body)
-        .ok()
+/// `Url` has already resolved `..` and `%2e%2e` segments when this runs.
+fn within_base_path(base_path: &str, path: &str) -> bool {
+    base_path.is_empty()
+        || path == base_path
+        || path
+            .strip_prefix(base_path)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn api_error(status: u16, method: &Method, path: &str, body: Option<&Value>) -> AppError {
+    let details: Vec<String> = body
         .and_then(|v| v.get("errors").and_then(Value::as_array).cloned())
         .map(|errs| {
             errs.iter()
@@ -280,6 +320,29 @@ mod tests {
     }
 
     #[test]
+    fn redirects_stay_under_the_base_path() {
+        let path = |u: &str| Url::parse(u).unwrap().path().to_string();
+        assert!(within_base_path("", "/anything"));
+        assert!(within_base_path("/redmine", &path("https://h/redmine")));
+        assert!(within_base_path(
+            "/redmine",
+            &path("https://h/redmine/issues/1.json")
+        ));
+        assert!(!within_base_path(
+            "/redmine",
+            &path("https://h/redmine-evil/x")
+        ));
+        assert!(!within_base_path(
+            "/redmine",
+            &path("https://h/redmine/../other")
+        ));
+        assert!(!within_base_path(
+            "/redmine",
+            &path("https://h/redmine/%2e%2e/other")
+        ));
+    }
+
+    #[test]
     fn read_limited_rejects_oversized_bodies() {
         assert_eq!(read_limited(&b"12345"[..], 5).unwrap(), "12345");
         assert!(read_limited(&b"123456"[..], 5).is_err());
@@ -303,5 +366,7 @@ mod tests {
             "https://r.example.evil.example/a"
         ));
         assert!(!ok("https://r.example/a", "https://r.example:8443/a"));
+        assert!(!ok("http://r.example:9101/a", "https://r.example:9102/a"));
+        assert!(ok("http://r.example:8080/a", "https://r.example/a"));
     }
 }

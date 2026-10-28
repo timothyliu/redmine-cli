@@ -120,7 +120,16 @@ pub fn pretty(value: &Value) -> String {
 /// and bidi overrides. Server content (issue text, error messages) can contain them.
 fn is_unsafe_char(c: char) -> bool {
     (c.is_control() && c != '\n' && c != '\t')
-        || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        || matches!(
+            c,
+            '\u{61c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
 }
 
 /// Text output: drop unsafe characters.
@@ -292,6 +301,7 @@ mod tests {
     #[test]
     fn strip_controls_keeps_newlines_and_tabs() {
         assert_eq!(strip_controls("a\x1b[2Kb\r\n\tc\u{7}"), "a[2Kb\n\tc");
+        assert_eq!(strip_controls("a\u{61c}b\u{2028}c\u{2029}d"), "abcd");
     }
 
     #[test]
