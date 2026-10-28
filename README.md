@@ -1,5 +1,7 @@
 # redmine-cli
 
+English | [繁體中文](README.zh-TW.md)
+
 An agent-friendly command-line client for [Redmine](https://www.redmine.org/), written in Rust.
 
 - **Predictable output:** compact JSON when stdout is not a terminal, and readable tables when it is.
