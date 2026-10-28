@@ -589,3 +589,85 @@ fn all_stops_at_byte_cap() {
     assert!(v["issues"].as_array().unwrap().len() < 200);
     pages.assert();
 }
+
+#[test]
+fn api_path_cannot_escape_base_path() {
+    let mut server = Server::new();
+    let anything = server.mock("GET", Matcher::Any).expect(0).create();
+
+    for path in [
+        "../other-app/collect",
+        "%2e%2e/other-app/collect",
+        "issues/..%2f..%2fother-app/collect",
+        "issues%5c..%5cother-app",
+    ] {
+        let out = redmine(&server)
+            .env("REDMINE_URL", format!("{}/redmine", server.url()))
+            .args(["api", path])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{path}");
+        assert_eq!(stderr_json(&out)["error"]["code"], "usage", "{path}");
+    }
+    anything.assert();
+}
+
+#[test]
+fn redirect_with_encoded_slash_is_not_followed() {
+    let mut server = Server::new();
+    let other_app = server
+        .mock("GET", Matcher::Regex("other-app".into()))
+        .expect(0)
+        .create();
+    server
+        .mock("GET", "/redmine/issues/1.json")
+        .with_status(302)
+        .with_header("location", "/redmine/..%2f..%2fother-app/collect")
+        .create();
+
+    let out = redmine(&server)
+        .env("REDMINE_URL", format!("{}/redmine", server.url()))
+        .args(["issue", "view", "1"])
+        .output()
+        .unwrap();
+    assert_eq!(stderr_json(&out)["error"]["code"], "redirect");
+    other_app.assert();
+}
+
+#[test]
+fn api_key_in_object_key_is_scrubbed() {
+    let mut server = Server::new();
+    server
+        .mock("GET", "/x.json")
+        .with_body(format!(r#"{{"note":{{"{KEY}":1}}}}"#))
+        .create();
+
+    let out = redmine(&server).args(["api", "/x.json"]).output().unwrap();
+    assert!(out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(KEY));
+    assert_eq!(stdout_json(&out)["note"]["[REDACTED]"], 1);
+}
+
+#[test]
+fn byte_cap_counts_memory_not_json_size() {
+    // `[]` is 2 bytes of JSON but a full `Value` in memory.
+    let mut server = Server::new();
+    let items: Vec<Value> = (0..100)
+        .map(|i| json!({"id": i, "a": vec![json!([]); 1000]}))
+        .collect();
+    server
+        .mock("GET", "/issues.json")
+        .match_query(Matcher::Any)
+        .with_body(json!({"issues": items, "total_count": 1_000_000u64}).to_string())
+        .create();
+
+    let out = redmine(&server)
+        .env("REDMINE_MAX_BYTES", "300000")
+        .args(["issue", "list", "--all"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v = stdout_json(&out);
+    assert_eq!(v["truncated"], true);
+    assert!(v["issues"].as_array().unwrap().len() < 50);
+}

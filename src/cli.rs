@@ -336,7 +336,7 @@ pub enum MetaCommand {
 
 #[derive(Args, Debug)]
 pub struct ApiArgs {
-    /// Path relative to the Redmine URL, e.g. /issues/1.json
+    /// Path relative to the Redmine URL, e.g. /issues/1.json (must stay under it)
     pub path: String,
     /// HTTP method
     #[arg(long, short = 'X', default_value = "GET")]

@@ -16,12 +16,15 @@ const MAX_PAGE: u32 = 100;
 const MAX_BODY_BYTES: u64 = 64 * 1024 * 1024;
 /// Default upper bound on items collected by `--all` (override: REDMINE_MAX_ITEMS).
 const DEFAULT_MAX_ITEMS: usize = 10_000;
-/// Default upper bound on JSON bytes collected by `--all` (override: REDMINE_MAX_BYTES).
+/// Default upper bound on the estimated memory of items collected by `--all`
+/// (override: REDMINE_MAX_BYTES).
 const DEFAULT_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 pub struct Client {
     http: Http,
     base: String,
+    base_url: Url,
+    base_path: String,
     key: String,
     pub dry_run: bool,
 }
@@ -32,21 +35,38 @@ impl Client {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(30);
+        let base_url =
+            Url::parse(base).map_err(|e| AppError::Config(format!("invalid URL {base}: {e}")))?;
+        let base_path = base_url.path().trim_end_matches('/').to_string();
         let http = Http::builder()
             .user_agent(concat!("redmine-cli/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(timeout))
-            .redirect(redirect_policy(base))
+            .redirect(redirect_policy(base_path.clone()))
             .build()?;
         Ok(Self {
             http,
             base: base.trim_end_matches('/').to_string(),
+            base_url,
+            base_path,
             key,
             dry_run,
         })
     }
 
-    fn url(&self, path: &str) -> String {
-        format!("{}/{}", self.base, path.trim_start_matches('/'))
+    /// Joins `path` to the base URL and refuses anything that would leave it
+    /// (`../other-app`, encoded separators), since the key goes with every request.
+    fn url(&self, path: &str) -> Result<Url> {
+        Url::parse(&format!("{}/{}", self.base, path.trim_start_matches('/')))
+            .ok()
+            .filter(|u| {
+                u.origin() == self.base_url.origin() && within_base_path(&self.base_path, u.path())
+            })
+            .ok_or_else(|| {
+                AppError::Usage(format!(
+                    "path {path:?} leaves {}: the API key is only sent there",
+                    self.base
+                ))
+            })
     }
 
     pub fn get(&self, path: &str, query: &[(String, String)]) -> Result<Value> {
@@ -63,7 +83,7 @@ impl Client {
         query: &[(String, String)],
         body: Option<&Value>,
     ) -> Result<Option<Value>> {
-        let url = self.url(path);
+        let url = self.url(path)?;
         if self.dry_run && method != Method::GET {
             let query: Map<String, Value> = query
                 .iter()
@@ -72,7 +92,7 @@ impl Client {
             return Ok(Some(json!({
                 "dry_run": true,
                 "method": method.as_str(),
-                "url": url,
+                "url": url.as_str(),
                 "query": query,
                 "body": body,
             })));
@@ -80,7 +100,7 @@ impl Client {
 
         let mut req = self
             .http
-            .request(method.clone(), &url)
+            .request(method.clone(), url)
             .header("X-Redmine-API-Key", &self.key)
             .header(ACCEPT, "application/json")
             .query(query);
@@ -122,12 +142,21 @@ impl Client {
         Ok(value)
     }
 
-    /// Masks the key in every string of a response (JSON values, or a raw XML/HTML body).
+    /// Masks the key in every string of a response (JSON values and object keys,
+    /// or a raw XML/HTML body).
     fn scrub_value(&self, value: &mut Value) {
         match value {
             Value::String(s) => *s = self.scrub(std::mem::take(s)),
             Value::Array(items) => items.iter_mut().for_each(|v| self.scrub_value(v)),
-            Value::Object(map) => map.values_mut().for_each(|v| self.scrub_value(v)),
+            Value::Object(map) => {
+                *map = std::mem::take(map)
+                    .into_iter()
+                    .map(|(k, mut v)| {
+                        self.scrub_value(&mut v);
+                        (self.scrub(k), v)
+                    })
+                    .collect();
+            }
             _ => {}
         }
     }
@@ -168,13 +197,13 @@ impl Client {
         let mut offset = u64::from(page.offset);
         let mut truncated = false;
         let total = loop {
-            let resp = self.get(path, &with_page(MAX_PAGE, offset))?;
-            let batch = resp
-                .get(key)
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
+            let mut resp = self.get(path, &with_page(MAX_PAGE, offset))?;
             let total = resp.get("total_count").and_then(Value::as_u64);
+            // Move the page out rather than clone it: a page can be large.
+            let batch = match resp.get_mut(key).map(Value::take) {
+                Some(Value::Array(items)) => items,
+                _ => Vec::new(),
+            };
             let n = batch.len() as u64;
             offset += n;
             for item in batch {
@@ -182,7 +211,7 @@ impl Client {
                     truncated = true;
                     break;
                 }
-                bytes += item.to_string().len();
+                bytes += mem_size(&item);
                 items.push(item);
             }
             let more = total.is_some_and(|t| n > 0 && offset < t);
@@ -215,6 +244,18 @@ fn env_limit(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Rough in-memory size of a parsed value. JSON size alone undercounts: `[]` is
+/// 2 bytes of JSON but a whole `Value` once parsed.
+fn mem_size(value: &Value) -> usize {
+    std::mem::size_of::<Value>()
+        + match value {
+            Value::String(s) => s.len(),
+            Value::Array(items) => items.iter().map(mem_size).sum(),
+            Value::Object(map) => map.iter().map(|(k, v)| k.len() + mem_size(v)).sum(),
+            _ => 0,
+        }
+}
+
 fn read_limited(body: impl Read, limit: u64) -> Result<String> {
     let mut buf = Vec::new();
     body.take(limit + 1).read_to_end(&mut buf)?;
@@ -243,10 +284,7 @@ fn remove_api_key_fields(value: &mut Value) {
 /// on the same host) and under the base path. reqwest strips `Authorization` on
 /// cross-host redirects but not custom headers, so following one would hand
 /// X-Redmine-API-Key to that host.
-fn redirect_policy(base: &str) -> Policy {
-    let base_path = Url::parse(base)
-        .map(|u| u.path().trim_end_matches('/').to_string())
-        .unwrap_or_default();
+fn redirect_policy(base_path: String) -> Policy {
     Policy::custom(move |attempt| {
         if attempt.previous().len() > 10 {
             return attempt.error("too many redirects");
@@ -274,13 +312,16 @@ fn same_origin_or_upgrade(from: &Url, to: &Url) -> bool {
     }
 }
 
-/// `Url` has already resolved `..` and `%2e%2e` segments when this runs.
+/// `Url` has already resolved `..` and `%2e%2e` segments when this runs, but it
+/// keeps encoded separators that a decoding proxy in front of Redmine would
+/// resolve later, so any `%2f`, `%5c` or `%2e` left below the base path is refused.
 fn within_base_path(base_path: &str, path: &str) -> bool {
-    base_path.is_empty()
-        || path == base_path
-        || path
-            .strip_prefix(base_path)
-            .is_some_and(|rest| rest.starts_with('/'))
+    let Some(rest) = path.strip_prefix(base_path) else {
+        return false;
+    };
+    let lower = rest.to_ascii_lowercase();
+    (rest.is_empty() || rest.starts_with('/'))
+        && !["%2f", "%5c", "%2e"].iter().any(|s| lower.contains(s))
 }
 
 fn api_error(status: u16, method: &Method, path: &str, body: Option<&Value>) -> AppError {
@@ -340,6 +381,26 @@ mod tests {
             "/redmine",
             &path("https://h/redmine/%2e%2e/other")
         ));
+        assert!(!within_base_path(
+            "/redmine",
+            &path("https://h/redmine/..%2F..%2fother")
+        ));
+        assert!(!within_base_path("", &path("https://h/a%5c..%5cother")));
+        assert!(!within_base_path("", &path("https://h/a/%2E%2e./x")));
+        // Encodings are matched case-insensitively.
+        assert!(!within_base_path("/r", &path("https://h/r/..%2F..%2Fx")));
+        assert!(!within_base_path("/r", &path("https://h/r/a%5Cb")));
+        assert!(!within_base_path("/r", &path("https://h/r/a%2Eb")));
+        // Only the part below the base path is checked.
+        assert!(within_base_path("/r%2e", &path("https://h/r%2e/x")));
+    }
+
+    #[test]
+    fn mem_size_counts_nodes_keys_and_strings() {
+        let node = std::mem::size_of::<Value>();
+        assert_eq!(mem_size(&json!([])), node);
+        assert_eq!(mem_size(&json!([[], []])), 3 * node);
+        assert_eq!(mem_size(&json!({"abcd": "xy"})), 2 * node + 4 + 2);
     }
 
     #[test]

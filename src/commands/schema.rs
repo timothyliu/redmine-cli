@@ -30,7 +30,7 @@ pub fn run(ctx: &Context, args: SchemaArgs) -> Result<()> {
             "REDMINE_FORMAT": "json | text",
             "REDMINE_TIMEOUT": "HTTP timeout in seconds (default: 30)",
             "REDMINE_MAX_ITEMS": "maximum items collected by --all (default: 10000)",
-            "REDMINE_MAX_BYTES": "maximum JSON bytes collected by --all (default: 268435456)",
+            "REDMINE_MAX_BYTES": "maximum estimated memory, in bytes, of items collected by --all (default: 268435456)",
             ENV_NO_KEYCHAIN: "set to 1 to never read or write the keychain",
         });
         value["conventions"] = json!({
@@ -38,7 +38,7 @@ pub fn run(ctx: &Context, args: SchemaArgs) -> Result<()> {
             "stderr": "errors as {\"error\": {\"code\", \"message\", ...}} in JSON mode",
             "lists": "{\"<collection>\": [...], \"total_count\", \"offset\", \"limit\"}",
             "objects": "unwrapped (no {\"issue\": ...} envelope)",
-            "secrets": "the API key string and api_key fields are masked in responses and errors",
+            "secrets": "the exact API key string (not other encodings of it) and api_key fields are masked in responses and errors",
             "truncation": "--all results carry \"truncated\": true when REDMINE_MAX_ITEMS or REDMINE_MAX_BYTES was hit",
         });
     }
