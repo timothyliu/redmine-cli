@@ -1,0 +1,36 @@
+[package]
+name = "redmine-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Agent-friendly command-line client for Redmine"
+license = "MIT"
+repository = "https://github.com/timothyliu/redmine-cli"
+readme = "README.md"
+keywords = ["redmine", "cli", "agent"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "redmine"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive", "env"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "rustls", "query"] }
+rpassword = "7.5.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+unicode-width = "0.2.3"
+url = "2.5.8"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+mockito = "1.7.2"
+predicates = "3.1.4"
+tempfile = "3.27.0"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
